@@ -1,12 +1,13 @@
 // 统一入口：兼容 Cloudflare Workers 和 Pages Functions
+// 私有访问版：配置环境变量 ACCESS_TOKEN 后，所有订阅/代理请求必须携带正确密钥
 export default {
   async fetch(request, env, ctx) {
     // Pages Functions 中 KV 需要从 env 中获取
     if (env && env.KV && typeof globalThis.KV === 'undefined') {
       globalThis.KV = env.KV
     }
-    
-    return handleRequest(request)
+
+    return handleRequest(request, env)
   }
 }
 
@@ -38,6 +39,41 @@ const FORMAT_CONFIG = {
   'base58': { proxy: false, base58: true },
   '3': { proxy: true, base58: true },
   'proxy-base58': { proxy: true, base58: true }
+}
+
+// ---------- 访问鉴权（私有模式）----------
+// 读取密钥：环境变量 ACCESS_TOKEN（推荐，在 CF 控制台加密配置）
+function getExpectedToken(env) {
+  try {
+    if (env && env.ACCESS_TOKEN) return String(env.ACCESS_TOKEN).trim()
+    if (typeof globalThis.ACCESS_TOKEN !== 'undefined' && globalThis.ACCESS_TOKEN) {
+      return String(globalThis.ACCESS_TOKEN).trim()
+    }
+  } catch (e) {}
+  return ''
+}
+
+// 恒定时间比较，避免时序泄露
+function timingSafeEqual(a, b) {
+  if (a.length !== b.length) return false
+  let diff = 0
+  for (let i = 0; i < a.length; i++) diff |= a.charCodeAt(i) ^ b.charCodeAt(i)
+  return diff === 0
+}
+
+function isAuthorized(request, reqUrl, expectedToken) {
+  // 未配置密钥 => 兼容旧行为（公开），但本部署已配置，故不会走到这里
+  if (!expectedToken) return true
+  const q = reqUrl.searchParams.get('token') || ''
+  if (q && timingSafeEqual(q, expectedToken)) return true
+  const auth = request.headers.get('Authorization') || ''
+  if (auth.startsWith('Bearer ')) {
+    const t = auth.slice(7).trim()
+    if (t && timingSafeEqual(t, expectedToken)) return true
+  }
+  const xToken = request.headers.get('X-Access-Token') || ''
+  if (xToken && timingSafeEqual(xToken.trim(), expectedToken)) return true
+  return false
 }
 
 // Base58 编码函数
@@ -121,7 +157,7 @@ async function logError(type, info) {
 }
 
 // ---------- 主逻辑 ----------
-async function handleRequest(request) {
+async function handleRequest(request, env) {
   // 快速处理 OPTIONS 请求
   if (request.method === 'OPTIONS') {
     return new Response(null, { status: 204, headers: CORS_HEADERS })
@@ -134,12 +170,23 @@ async function handleRequest(request) {
   const prefixParam = reqUrl.searchParams.get('prefix')
   const sourceParam = reqUrl.searchParams.get('source')
 
+  const expectedToken = getExpectedToken(env)
   const currentOrigin = reqUrl.origin
+  // 私有模式：把密钥透传进每个采集站代理链接，保证 App 二次请求仍带鉴权
+  const tokenQuery = expectedToken ? ('&token=' + expectedToken) : ''
   const defaultPrefix = currentOrigin + '/?url='
 
-  // 🩺 健康检查（最常见的性能检查，提前处理）
+  // 🩺 健康检查（不暴露任何订阅信息，无需鉴权，便于探活）
   if (pathname === '/health') {
     return new Response('OK', { status: 200, headers: CORS_HEADERS })
+  }
+
+  // 🔒 私有访问门控：订阅与代理接口一律校验密钥
+  if (!isAuthorized(request, reqUrl, expectedToken)) {
+    return new Response(
+      JSON.stringify({ error: 'Forbidden', message: '缺少或错误的访问密钥（token）' }),
+      { status: 403, headers: { 'Content-Type': 'application/json; charset=utf-8', ...CORS_HEADERS } }
+    )
   }
 
   // 通用代理请求处理
@@ -149,11 +196,14 @@ async function handleRequest(request) {
 
   // JSON 格式输出处理
   if (formatParam !== null) {
-    return handleFormatRequest(formatParam, sourceParam, prefixParam, defaultPrefix)
+    return handleFormatRequest(formatParam, sourceParam, prefixParam, defaultPrefix, tokenQuery)
   }
 
-  // 返回首页文档
-  return handleHomePage(currentOrigin, defaultPrefix)
+  // 私有模式不公开使用文档，仅返回极简提示，避免泄露接口结构
+  return new Response('Private LunaTV subscription service.', {
+    status: 200,
+    headers: { 'Content-Type': 'text/plain; charset=utf-8', ...CORS_HEADERS }
+  })
 }
 
 // ---------- 代理请求处理子模块 ----------
@@ -217,7 +267,7 @@ async function handleProxyRequest(request, targetUrlParam, currentOrigin) {
 }
 
 // ---------- JSON 格式输出处理子模块 ----------
-async function handleFormatRequest(formatParam, sourceParam, prefixParam, defaultPrefix) {
+async function handleFormatRequest(formatParam, sourceParam, prefixParam, defaultPrefix, tokenQuery) {
   try {
     const config = FORMAT_CONFIG[formatParam]
     if (!config) {
@@ -226,10 +276,16 @@ async function handleFormatRequest(formatParam, sourceParam, prefixParam, defaul
 
     const selectedSource = JSON_SOURCES[sourceParam] || JSON_SOURCES['full']
     const data = await getCachedJSON(selectedSource)
-    
+
+    // 代理前缀：自定义 prefix 优先；否则用本 Worker 前缀，并把 token 透传到每个采集站链接
+    let proxyPrefix = prefixParam || defaultPrefix
     const newData = config.proxy
-      ? addOrReplacePrefix(data, prefixParam || defaultPrefix)
+      ? addOrReplacePrefix(data, proxyPrefix)
       : data
+    if (config.proxy && tokenQuery) {
+      // 在每个生成的代理 URL 上追加 token（addOrReplacePrefix 产出形如 origin/?url=xxx）
+      appendTokenToApi(newData, tokenQuery)
+    }
 
     if (config.base58) {
       const encoded = base58Encode(newData)
@@ -247,113 +303,20 @@ async function handleFormatRequest(formatParam, sourceParam, prefixParam, defaul
   }
 }
 
-// ---------- 首页文档处理 ----------
-async function handleHomePage(currentOrigin, defaultPrefix) {
-  const html = `<!DOCTYPE html>
-<html lang="zh-CN">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>API 中转代理服务</title>
-  <style>
-    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Arial, sans-serif; max-width: 800px; margin: 50px auto; padding: 20px; line-height: 1.6; }
-    h1 { color: #333; }
-    h2 { color: #555; margin-top: 30px; }
-    code { background: #f4f4f4; padding: 2px 6px; border-radius: 3px; font-size: 14px; }
-    pre { background: #f4f4f4; padding: 15px; border-radius: 5px; overflow-x: auto; }
-    .example { background: #e8f5e9; padding: 15px; border-left: 4px solid #4caf50; margin: 20px 0; }
-    .section { background: #f9f9f9; padding: 15px; border-radius: 5px; margin: 15px 0; }
-    table { width: 100%; border-collapse: collapse; margin: 15px 0; }
-    table td { padding: 8px; border: 1px solid #ddd; }
-    table td:first-child { background: #f5f5f5; font-weight: bold; width: 30%; }
-  </style>
-</head>
-<body>
-  <h1>🔄 API 中转代理服务</h1>
-  <p>通用 API 中转代理，用于访问被墙或限制的接口。</p>
-  
-  <h2>使用方法</h2>
-  <p>中转任意 API：在请求 URL 后添加 <code>?url=目标地址</code> 参数</p>
-  <pre>${defaultPrefix}<示例API地址></pre>
-  
-  <h2>配置订阅参数说明</h2>
-  <div class="section">
-    <table>
-      <tr>
-        <td>format</td>
-        <td><code>0</code> 或 <code>raw</code> = 原始 JSON<br>
-            <code>1</code> 或 <code>proxy</code> = 添加代理前缀<br>
-            <code>2</code> 或 <code>base58</code> = 原始 Base58 编码<br>
-            <code>3</code> 或 <code>proxy-base58</code> = 代理 Base58 编码</td>
-      </tr>
-      <tr>
-        <td>source</td>
-        <td><code>jin18</code> = 精简版<br>
-            <code>jingjian</code> = 精简版+成人<br>
-            <code>full</code> = 完整版（默认）</td>
-      </tr>
-      <tr>
-        <td>prefix</td>
-        <td>自定义代理前缀（仅在 format=1 或 3 时生效）</td>
-      </tr>
-    </table>
-  </div>
-  
-  <h2>配置订阅链接示例</h2>
-    
-  <div class="section">
-    <h3>📦 精简版（jin18）</h3>
-    <p>原始 JSON：<br><code class="copyable">${currentOrigin}?format=0&source=jin18</code> <button class="copy-btn">复制</button></p>
-    <p>中转代理 JSON：<br><code class="copyable">${currentOrigin}?format=1&source=jin18</code> <button class="copy-btn">复制</button></p>
-    <p>原始 Base58：<br><code class="copyable">${currentOrigin}?format=2&source=jin18</code> <button class="copy-btn">复制</button></p>
-    <p>中转 Base58：<br><code class="copyable">${currentOrigin}?format=3&source=jin18</code> <button class="copy-btn">复制</button></p>
-  </div>
-  
-  <div class="section">
-    <h3>📦 精简版+成人（jingjian）</h3>
-    <p>原始 JSON：<br><code class="copyable">${currentOrigin}?format=0&source=jingjian</code> <button class="copy-btn">复制</button></p>
-    <p>中转代理 JSON：<br><code class="copyable">${currentOrigin}?format=1&source=jingjian</code> <button class="copy-btn">复制</button></p>
-    <p>原始 Base58：<br><code class="copyable">${currentOrigin}?format=2&source=jingjian</code> <button class="copy-btn">复制</button></p>
-    <p>中转 Base58：<br><code class="copyable">${currentOrigin}?format=3&source=jingjian</code> <button class="copy-btn">复制</button></p>
-  </div>
-  
-  <div class="section">
-    <h3>📦 完整版（full，默认）</h3>
-    <p>原始 JSON：<br><code class="copyable">${currentOrigin}?format=0&source=full</code> <button class="copy-btn">复制</button></p>
-    <p>中转代理 JSON：<br><code class="copyable">${currentOrigin}?format=1&source=full</code> <button class="copy-btn">复制</button></p>
-    <p>原始 Base58：<br><code class="copyable">${currentOrigin}?format=2&source=full</code> <button class="copy-btn">复制</button></p>
-    <p>中转 Base58：<br><code class="copyable">${currentOrigin}?format=3&source=full</code> <button class="copy-btn">复制</button></p>
-  </div>
-  
-  <h2>支持的功能</h2>
-  <ul>
-    <li>✅ 支持 GET、POST、PUT、DELETE 等所有 HTTP 方法</li>
-    <li>✅ 自动转发请求头和请求体</li>
-    <li>✅ 保留原始响应头（除敏感信息）</li>
-    <li>✅ 完整的 CORS 支持</li>
-    <li>✅ 超时保护（9 秒）</li>
-    <li>✅ 支持多种配置源切换</li>
-    <li>✅ 支持 Base58 编码输出</li>
-  </ul>
-  
-  <script>
-    document.querySelectorAll('.copy-btn').forEach((btn, idx) => {
-      btn.addEventListener('click', () => {
-        const text = document.querySelectorAll('.copyable')[idx].innerText;
-        navigator.clipboard.writeText(text).then(() => {
-          btn.innerText = '已复制！';
-          setTimeout(() => (btn.innerText = '复制'), 1500);
-        });
-      });
-    });
-  </script>
-</body>
-</html>`
-
-  return new Response(html, { 
-    status: 200, 
-    headers: { 'Content-Type': 'text/html; charset=utf-8', ...CORS_HEADERS } 
-  })
+// 给配置里所有 api 代理链接追加 token 查询参数
+function appendTokenToApi(obj, tokenQuery) {
+  if (typeof obj !== 'object' || obj === null) return
+  if (Array.isArray(obj)) {
+    for (const item of obj) appendTokenToApi(item, tokenQuery)
+    return
+  }
+  for (const key in obj) {
+    if (key === 'api' && typeof obj[key] === 'string' && obj[key].includes('?url=')) {
+      if (!obj[key].includes('token=')) obj[key] = obj[key] + tokenQuery
+    } else {
+      appendTokenToApi(obj[key], tokenQuery)
+    }
+  }
 }
 
 // ---------- 统一错误响应处理 ----------
