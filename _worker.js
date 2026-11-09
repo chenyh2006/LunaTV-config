@@ -121,6 +121,43 @@ function addOrReplacePrefix(obj, newPrefix) {
   return newObj
 }
 
+// 从代理 URL 中还原出原始目标地址（兼容编码与未编码两种历史形式）
+function extractTargetUrl(proxyUrl) {
+  try {
+    const u = new URL(proxyUrl)
+    const t = u.searchParams.get('url')
+    if (t) return t
+  } catch (e) {}
+  // 兜底：未编码旧链接，在顶层 token 前截断
+  const m = proxyUrl.match(/[?&]url=(.*?)(?:&token=|$)/)
+  return m ? decodeURIComponent(m[1]) : proxyUrl
+}
+
+// 把所有 api 代理链接规范化为：<origin>/?url=<编码后的目标>&token=<密钥>
+// 目标编码后，token 始终是独立顶层参数，绝不会被并入转发目标
+function normalizeProxyApi(obj, token) {
+  if (typeof obj !== 'object' || obj === null) return
+  if (Array.isArray(obj)) {
+    for (const item of obj) normalizeProxyApi(item, token)
+    return
+  }
+  for (const key in obj) {
+    if (key === 'api' && typeof obj[key] === 'string' && obj[key].includes('?url=')) {
+      try {
+        const proxy = new URL(obj[key])
+        const target = extractTargetUrl(obj[key])
+        let rebuilt = proxy.origin + '/?url=' + encodeURIComponent(target)
+        if (token) rebuilt += '&token=' + encodeURIComponent(token)
+        obj[key] = rebuilt
+      } catch (e) {
+        if (!obj[key].includes('token=')) obj[key] += ('&token=' + token)
+      }
+    } else {
+      normalizeProxyApi(obj[key], token)
+    }
+  }
+}
+
 // ---------- 安全版：KV 缓存 ----------
 async function getCachedJSON(url) {
   const kvAvailable = typeof KV !== 'undefined' && KV && typeof KV.get === 'function'
@@ -149,10 +186,7 @@ async function getCachedJSON(url) {
 
 // ---------- 安全版：错误日志 ----------
 async function logError(type, info) {
-  // 保留错误输出，便于调试
   console.error('[ERROR]', type, info)
-
-  // 禁止写入 KV
   return
 }
 
@@ -172,8 +206,6 @@ async function handleRequest(request, env) {
 
   const expectedToken = getExpectedToken(env)
   const currentOrigin = reqUrl.origin
-  // 私有模式：把密钥透传进每个采集站代理链接，保证 App 二次请求仍带鉴权
-  const tokenQuery = expectedToken ? ('&token=' + expectedToken) : ''
   const defaultPrefix = currentOrigin + '/?url='
 
   // 🩺 健康检查（不暴露任何订阅信息，无需鉴权，便于探活）
@@ -196,7 +228,7 @@ async function handleRequest(request, env) {
 
   // JSON 格式输出处理
   if (formatParam !== null) {
-    return handleFormatRequest(formatParam, sourceParam, prefixParam, defaultPrefix, tokenQuery)
+    return handleFormatRequest(formatParam, sourceParam, prefixParam, defaultPrefix, expectedToken)
   }
 
   // 私有模式不公开使用文档，仅返回极简提示，避免泄露接口结构
@@ -208,19 +240,32 @@ async function handleRequest(request, env) {
 
 // ---------- 代理请求处理子模块 ----------
 async function handleProxyRequest(request, targetUrlParam, currentOrigin) {
+  const reqUrl = new URL(request.url)
+  // 标准解析：url 是独立查询参数（规范编码链接），token 不会被并入目标
+  let fullTargetUrl = reqUrl.searchParams.get('url')
+  if (!fullTargetUrl) {
+    // 兜底：兼容未编码的历史链接，在顶层 token 前截断
+    const m = request.url.match(/[?&]url=(.*?)(?:&token=|$)/)
+    fullTargetUrl = m ? decodeURIComponent(m[1]) : targetUrlParam
+  }
+  // 双保险：若目标里误带了顶层 token 参数，移除后再转发
+  try {
+    const tu = new URL(fullTargetUrl)
+    if (tu.searchParams.has('token')) {
+      tu.searchParams.delete('token')
+      fullTargetUrl = tu.toString()
+    }
+  } catch (e) {}
+
   // 🚨 防止递归调用自身
-  if (targetUrlParam.startsWith(currentOrigin)) {
-    return errorResponse('Loop detected: self-fetch blocked', { url: targetUrlParam }, 400)
+  if (fullTargetUrl.startsWith(currentOrigin)) {
+    return errorResponse('Loop detected: self-fetch blocked', { url: fullTargetUrl }, 400)
   }
 
   // 🚨 防止无效 URL
-  if (!/^https?:\/\//i.test(targetUrlParam)) {
-    return errorResponse('Invalid target URL', { url: targetUrlParam }, 400)
+  if (!/^https?:\/\//i.test(fullTargetUrl)) {
+    return errorResponse('Invalid target URL', { url: fullTargetUrl }, 400)
   }
-
-  let fullTargetUrl = targetUrlParam
-  const urlMatch = request.url.match(/[?&]url=([^&]+(?:&.*)?)/)
-  if (urlMatch) fullTargetUrl = decodeURIComponent(urlMatch[1])
 
   let targetURL
   try {
@@ -267,7 +312,7 @@ async function handleProxyRequest(request, targetUrlParam, currentOrigin) {
 }
 
 // ---------- JSON 格式输出处理子模块 ----------
-async function handleFormatRequest(formatParam, sourceParam, prefixParam, defaultPrefix, tokenQuery) {
+async function handleFormatRequest(formatParam, sourceParam, prefixParam, defaultPrefix, expectedToken) {
   try {
     const config = FORMAT_CONFIG[formatParam]
     if (!config) {
@@ -277,14 +322,12 @@ async function handleFormatRequest(formatParam, sourceParam, prefixParam, defaul
     const selectedSource = JSON_SOURCES[sourceParam] || JSON_SOURCES['full']
     const data = await getCachedJSON(selectedSource)
 
-    // 代理前缀：自定义 prefix 优先；否则用本 Worker 前缀，并把 token 透传到每个采集站链接
-    let proxyPrefix = prefixParam || defaultPrefix
     const newData = config.proxy
-      ? addOrReplacePrefix(data, proxyPrefix)
+      ? addOrReplacePrefix(data, prefixParam || defaultPrefix)
       : data
-    if (config.proxy && tokenQuery) {
-      // 在每个生成的代理 URL 上追加 token（addOrReplacePrefix 产出形如 origin/?url=xxx）
-      appendTokenToApi(newData, tokenQuery)
+    // 代理模式：把每个采集站链接规范化为编码形式并独立附带 token
+    if (config.proxy && expectedToken) {
+      normalizeProxyApi(newData, expectedToken)
     }
 
     if (config.base58) {
@@ -300,22 +343,6 @@ async function handleFormatRequest(formatParam, sourceParam, prefixParam, defaul
   } catch (err) {
     await logError('json', { message: err.message })
     return errorResponse(err.message, {}, 500)
-  }
-}
-
-// 给配置里所有 api 代理链接追加 token 查询参数
-function appendTokenToApi(obj, tokenQuery) {
-  if (typeof obj !== 'object' || obj === null) return
-  if (Array.isArray(obj)) {
-    for (const item of obj) appendTokenToApi(item, tokenQuery)
-    return
-  }
-  for (const key in obj) {
-    if (key === 'api' && typeof obj[key] === 'string' && obj[key].includes('?url=')) {
-      if (!obj[key].includes('token=')) obj[key] = obj[key] + tokenQuery
-    } else {
-      appendTokenToApi(obj[key], tokenQuery)
-    }
   }
 }
 
