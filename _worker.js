@@ -376,20 +376,18 @@ function buildTVBoxConfig(data, reqUrl, token, sourceParam) {
       sites.push({
         key: 'src' + idx,
         name: v.name || host,
-        type: 3,
+        type: 1,
         api: proxied,
         searchable: 1,
         quickSearch: 1,
-        filterable: 0
+        changeable: 1
       })
     }
   }
   return {
     sites,
     lives: [],
-    parses: [],
-    flags: ['youku', 'qq', 'iqiyi', 'qiyi', 'letv', 'sohu', 'tudou', 'pptv', 'mgtv', 'wasu', 'bilibili', 'renrenmi'],
-    wallPaper: 'https://picsum.photos/1920/1080'
+    wallpaper: 'https://picsum.photos/1920/1080'
   }
 }
 
