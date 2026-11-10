@@ -385,6 +385,7 @@ function buildTVBoxConfig(data, reqUrl, token, sourceParam) {
     }
   }
   return {
+    spider: 'https://test.59bang.com/jar/lm261103.jar;md5;d3ef8f4097ea93941492c5e36d84d19e',
     sites,
     lives: [],
     wallpaper: 'https://picsum.photos/1920/1080'
