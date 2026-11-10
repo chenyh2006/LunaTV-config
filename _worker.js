@@ -38,7 +38,9 @@ const FORMAT_CONFIG = {
   '2': { proxy: false, base58: true },
   'base58': { proxy: false, base58: true },
   '3': { proxy: true, base58: true },
-  'proxy-base58': { proxy: true, base58: true }
+  'proxy-base58': { proxy: true, base58: true },
+  '4': { tvbox: true },
+  'tvbox': { tvbox: true }
 }
 
 // ---------- 访问鉴权（私有模式）----------
@@ -228,7 +230,7 @@ async function handleRequest(request, env) {
 
   // JSON 格式输出处理
   if (formatParam !== null) {
-    return handleFormatRequest(formatParam, sourceParam, prefixParam, defaultPrefix, expectedToken)
+    return handleFormatRequest(formatParam, sourceParam, prefixParam, defaultPrefix, expectedToken, reqUrl)
   }
 
   // 私有模式不公开使用文档，仅返回极简提示，避免泄露接口结构
@@ -248,13 +250,15 @@ async function handleProxyRequest(request, targetUrlParam, currentOrigin) {
     const m = request.url.match(/[?&]url=(.*?)(?:&token=|$)/)
     fullTargetUrl = m ? decodeURIComponent(m[1]) : targetUrlParam
   }
-  // 双保险：若目标里误带了顶层 token 参数，移除后再转发
+  // 双保险：移除误并入目标的 token；并把 TVBox 搜索/分类等业务参数透传给目标
   try {
     const tu = new URL(fullTargetUrl)
-    if (tu.searchParams.has('token')) {
-      tu.searchParams.delete('token')
-      fullTargetUrl = tu.toString()
+    if (tu.searchParams.has('token')) tu.searchParams.delete('token')
+    const RESERVED = new Set(['url', 'token', 'prefix', 'format', 'source'])
+    for (const [k, val] of reqUrl.searchParams.entries()) {
+      if (!RESERVED.has(k) && !tu.searchParams.has(k)) tu.searchParams.append(k, val)
     }
+    fullTargetUrl = tu.toString()
   } catch (e) {}
 
   // 🚨 防止递归调用自身
@@ -312,7 +316,7 @@ async function handleProxyRequest(request, targetUrlParam, currentOrigin) {
 }
 
 // ---------- JSON 格式输出处理子模块 ----------
-async function handleFormatRequest(formatParam, sourceParam, prefixParam, defaultPrefix, expectedToken) {
+async function handleFormatRequest(formatParam, sourceParam, prefixParam, defaultPrefix, expectedToken, reqUrl) {
   try {
     const config = FORMAT_CONFIG[formatParam]
     if (!config) {
@@ -321,6 +325,14 @@ async function handleFormatRequest(formatParam, sourceParam, prefixParam, defaul
 
     const selectedSource = JSON_SOURCES[sourceParam] || JSON_SOURCES['full']
     const data = await getCachedJSON(selectedSource)
+
+    // TVBox 标准 sites 格式（TVBox / LMbox 等 com.github.tvbox.osc 系 App）
+    if (config.tvbox) {
+      const tvbox = buildTVBoxConfig(data, reqUrl, expectedToken, sourceParam)
+      return new Response(JSON.stringify(tvbox), {
+        headers: { 'Content-Type': 'application/json;charset=UTF-8', ...CORS_HEADERS },
+      })
+    }
 
     const newData = config.proxy
       ? addOrReplacePrefix(data, prefixParam || defaultPrefix)
@@ -343,6 +355,41 @@ async function handleFormatRequest(formatParam, sourceParam, prefixParam, defaul
   } catch (err) {
     await logError('json', { message: err.message })
     return errorResponse(err.message, {}, 500)
+  }
+}
+
+// 把 LunaTV 的 api_site 对象转换为标准 TVBox 配置（sites 数组，苹果 CMS type=3）
+function buildTVBoxConfig(data, reqUrl, token, sourceParam) {
+  const sites = []
+  const apiSite = data && data.api_site
+  if (apiSite && typeof apiSite === 'object') {
+    const entries = Array.isArray(apiSite)
+      ? apiSite.map((v, i) => [v.key || v.name || ('s' + i), v])
+      : Object.entries(apiSite)
+    let idx = 0
+    for (const [host, v] of entries) {
+      if (!v || !v.api) continue
+      idx += 1
+      // 采集站基础地址走 Worker 代理（带 token）；TVBox 搜索/分类参数由代理透传
+      const proxied = reqUrl.origin + '/?url=' + encodeURIComponent(v.api) +
+        (token ? '&token=' + encodeURIComponent(token) : '')
+      sites.push({
+        key: 'src' + idx,
+        name: v.name || host,
+        type: 3,
+        api: proxied,
+        searchable: 1,
+        quickSearch: 1,
+        filterable: 0
+      })
+    }
+  }
+  return {
+    sites,
+    lives: [],
+    parses: [],
+    flags: ['youku', 'qq', 'iqiyi', 'qiyi', 'letv', 'sohu', 'tudou', 'pptv', 'mgtv', 'wasu', 'bilibili', 'renrenmi'],
+    wallPaper: 'https://picsum.photos/1920/1080'
   }
 }
 
